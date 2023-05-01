@@ -1583,9 +1583,11 @@ void ppc_compat_add_property(Object *obj, const char *name,
 #define SPR_PSPB              (0x09F)
 #define SPR_DPDES             (0x0B0)
 #define SPR_DAWR0             (0x0B4)
+#define SPR_DAWR1             (0x0B5)
 #define SPR_RPR               (0x0BA)
 #define SPR_CIABR             (0x0BB)
 #define SPR_DAWRX0            (0x0BC)
+#define SPR_DAWRX1            (0x0BD)
 #define SPR_HFSCR             (0x0BE)
 #define SPR_VRSAVE            (0x100)
 #define SPR_USPRG0            (0x100)
@@ -1654,6 +1656,7 @@ void ppc_compat_add_property(Object *obj, const char *name,
 #define SPR_HMEER             (0x151)
 #define SPR_PCR               (0x152)
 #define SPR_BOOKE_LPIDR       (0x152)
+#define SPR_HEIR              (0x153)
 #define SPR_BOOKE_TCR         (0x154)
 #define SPR_BOOKE_TLB0PS      (0x158)
 #define SPR_BOOKE_TLB1PS      (0x159)
@@ -2773,6 +2776,8 @@ void dump_mmu(CPUPPCState *env);
 void ppc_maybe_bswap_register(CPUPPCState *env, uint8_t *mem_buf, int len);
 void ppc_store_vscr(CPUPPCState *env, uint32_t vscr);
 uint32_t ppc_get_vscr(CPUPPCState *env);
+void ppc_store_cr(CPUPPCState *env, uint64_t cr);
+uint64_t ppc_get_cr(CPUPPCState *env);
 
 /*****************************************************************************/
 /* Power management enable checks                                            */

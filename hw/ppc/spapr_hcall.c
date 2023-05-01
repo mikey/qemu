@@ -3,12 +3,14 @@
 #include "qapi/error.h"
 #include "sysemu/hw_accel.h"
 #include "sysemu/runstate.h"
+#include "sysemu/tcg.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
+#include "qemu/compiler.h"
+#include "qemu/bswap.h"
 #include "exec/exec-all.h"
-#include "exec/tb-flush.h"
 #include "helper_regs.h"
 #include "hw/ppc/ppc.h"
 #include "hw/ppc/spapr.h"
@@ -22,6 +24,7 @@
 #include "hw/ppc/spapr_numa.h"
 #include "mmu-book3s-v3.h"
 #include "hw/mem/memory-device.h"
+#include "exec/tb-flush.h"
 
 bool is_ram_address(SpaprMachineState *spapr, hwaddr addr)
 {
@@ -1496,6 +1499,7 @@ target_ulong spapr_hypercall(PowerPCCPU *cpu, target_ulong opcode,
 }
 
 #ifdef CONFIG_TCG
+
 #define PRTS_MASK      0x1f
 
 static target_ulong h_set_ptbl(PowerPCCPU *cpu,
@@ -1513,7 +1517,7 @@ static target_ulong h_set_ptbl(PowerPCCPU *cpu,
         return H_PARAMETER;
     }
 
-    spapr->nested_ptcr = ptcr; /* Save new partition table */
+    spapr->nested.ptcr = ptcr; /* Save new partition table */
 
     return H_SUCCESS;
 }
@@ -1544,6 +1548,151 @@ static target_ulong h_copy_tofrom_guest(PowerPCCPU *cpu,
     return H_FUNCTION;
 }
 
+static void restore_common_regs(CPUPPCState *dst, CPUPPCState *src)
+{
+    memcpy(dst->gpr, src->gpr, sizeof(dst->gpr));
+    memcpy(dst->crf, src->crf, sizeof(dst->crf));
+    memcpy(dst->vsr, src->vsr, sizeof(dst->vsr));
+    dst->nip = src->nip;
+    dst->msr = src->msr;
+    dst->lr  = src->lr;
+    dst->ctr = src->ctr;
+    dst->cfar = src->cfar;
+    cpu_write_xer(dst, src->xer);
+    ppc_store_vscr(dst, ppc_get_vscr(src));
+    ppc_store_fpscr(dst, src->fpscr);
+
+    memcpy(dst->spr, src->spr, sizeof(dst->spr));
+}
+
+static void restore_hdec_from_hvstate_env(CPUPPCState *dst,
+                                          struct kvmppc_hv_guest_state *hv_state,
+                                          CPUPPCState *src, target_ulong now)
+{
+    target_ulong hdec;
+    if (hv_state) {
+        hdec = hv_state->hdec_expiry - now;
+    } else if (src) {
+        hdec = src->tb_env->hdecr_expiry_tb - now;
+    } else {
+        assert(0); /* shall not reach here */
+    }
+    cpu_ppc_hdecr_init(dst);
+    cpu_ppc_store_hdecr(dst, hdec);
+}
+
+static void restore_lpcr_from_hvstate_env(PowerPCCPU *cpu,
+                                          struct kvmppc_hv_guest_state *hv_state,
+                                          CPUPPCState *src)
+{
+    PowerPCCPUClass *pcc = POWERPC_CPU_GET_CLASS(cpu);
+    CPUPPCState *dst = &cpu->env;
+    target_ulong lpcr, lpcr_mask;
+    lpcr_mask = LPCR_DPFD | LPCR_ILE | LPCR_AIL | LPCR_LD | LPCR_MER;
+    if (hv_state) {
+        lpcr = (dst->spr[SPR_LPCR] & ~lpcr_mask) | (hv_state->lpcr & lpcr_mask);
+    } else if (src) {
+        lpcr = (dst->spr[SPR_LPCR] & ~lpcr_mask) |
+               (src->spr[SPR_LPCR] & lpcr_mask);
+    } else {
+        assert(0); /* shall not reach here */
+    }
+    lpcr |= LPCR_HR | LPCR_UPRT | LPCR_GTSE | LPCR_HVICE | LPCR_HDICE;
+    lpcr &= ~LPCR_LPES0;
+    dst->spr[SPR_LPCR] = lpcr & pcc->lpcr_mask;
+}
+
+static void restore_env_from_ptregs_hvstate(CPUPPCState *env,
+                                            struct kvmppc_pt_regs *regs,
+                                            struct kvmppc_hv_guest_state *hv_state)
+{
+    assert(env);
+    assert(regs);
+    assert(hv_state);
+    assert(sizeof(env->gpr) == sizeof(regs->gpr));
+    memcpy(env->gpr, regs->gpr, sizeof(env->gpr));
+    env->nip = regs->nip;
+    env->msr = regs->msr;
+    env->lr = regs->link;
+    env->ctr = regs->ctr;
+    cpu_write_xer(env, regs->xer);
+    ppc_store_cr(env, regs->ccr);
+    /* hv_state->amor is not used in api v1 */
+    env->spr[SPR_HFSCR] = hv_state->hfscr;
+    /* TCG does not implement DAWR*, CIABR, PURR, SPURR, IC, VTB, HEIR SPRs*/
+    env->cfar = hv_state->cfar;
+    env->spr[SPR_PCR]      = hv_state->pcr;
+    env->spr[SPR_DPDES]     = hv_state->dpdes;
+    env->spr[SPR_SRR0]      = hv_state->srr0;
+    env->spr[SPR_SRR1]      = hv_state->srr1;
+    env->spr[SPR_SPRG0]     = hv_state->sprg[0];
+    env->spr[SPR_SPRG1]     = hv_state->sprg[1];
+    env->spr[SPR_SPRG2]     = hv_state->sprg[2];
+    env->spr[SPR_SPRG3]     = hv_state->sprg[3];
+    env->spr[SPR_BOOKS_PID] = hv_state->pidr;
+    env->spr[SPR_PPR]       = hv_state->ppr;
+}
+
+static void enter_nested(PowerPCCPU *cpu,
+                         uint64_t lpid,
+                         struct kvmppc_hv_guest_state *hv_state,
+                         struct kvmppc_pt_regs *regs,
+                         struct SpaprMachineStateNestedGuestVcpu *vcpu)
+{
+    SpaprMachineState *spapr = SPAPR_MACHINE(qdev_get_machine());
+    CPUState *cs = CPU(cpu);
+    CPUPPCState *env = &cpu->env;
+    SpaprCpuState *spapr_cpu = spapr_cpu_state(cpu);
+    target_ulong now = cpu_ppc_load_tbl(env);
+
+    assert(env->spr[SPR_LPIDR] == 0);
+    // TODO: we should preallocate this
+    spapr_cpu->nested_host_state = g_try_new(CPUPPCState, 1);
+    assert(spapr_cpu->nested_host_state);
+    memcpy(spapr_cpu->nested_host_state, env, sizeof(CPUPPCState));
+
+    if (spapr->nested.api == NESTED_API_KVM_HV) {
+        /* API v1 */
+        restore_env_from_ptregs_hvstate(env, regs, hv_state);
+        restore_lpcr_from_hvstate_env(cpu, hv_state, NULL);
+        restore_hdec_from_hvstate_env(env, hv_state, NULL, now);
+        spapr_cpu->nested_tb_offset = hv_state->tb_offset;
+    } else {
+        /* API v2 */
+        assert(vcpu);
+        assert(!hv_state);
+        assert(!regs);
+        assert(sizeof(env->gpr) == sizeof(vcpu->env.gpr));
+        restore_common_regs(env, &vcpu->env);
+        restore_lpcr_from_hvstate_env(cpu, NULL, &vcpu->env);
+        restore_hdec_from_hvstate_env(env, NULL, &vcpu->env, now);
+        cpu_ppc_store_decr(env, vcpu->dec_expiry_tb - now);
+        spapr_cpu->nested_tb_offset = vcpu->tb_offset;
+    }
+    env->spr[SPR_LPIDR] = lpid; /* post restore_common_regs */
+
+    /*
+     * The hv_state->vcpu_token is not needed. It is used by the KVM
+     * implementation to remember which L2 vCPU last ran on which physical
+     * CPU so as to invalidate process scope translations if it is moved
+     * between physical CPUs. For now TLBs are always flushed on L1<->L2
+     * transitions so this is not a problem.
+     *
+     * Could validate that the same vcpu_token does not attempt to run on
+     * different L1 vCPUs at the same time, but that would be a L1 KVM bug
+     * and it's not obviously worth a new data structure to do it.
+     */
+
+    env->tb_env->tb_offset += spapr_cpu->nested_tb_offset;
+    spapr_cpu->in_nested = true;
+
+    hreg_compute_hflags(env);
+    ppc_maybe_interrupt(env);
+    tlb_flush(cs);
+    env->reserve_addr = -1; /* Reset the reservation */
+
+}
+
 /*
  * When this handler returns, the environment is switched to the L2 guest
  * and TCG begins running that. spapr_exit_nested() performs the switch from
@@ -1554,22 +1703,15 @@ static target_ulong h_enter_nested(PowerPCCPU *cpu,
                                    target_ulong opcode,
                                    target_ulong *args)
 {
-    PowerPCCPUClass *pcc = POWERPC_CPU_GET_CLASS(cpu);
-    CPUState *cs = CPU(cpu);
     CPUPPCState *env = &cpu->env;
-    SpaprCpuState *spapr_cpu = spapr_cpu_state(cpu);
     target_ulong hv_ptr = args[0];
     target_ulong regs_ptr = args[1];
-    target_ulong hdec, now = cpu_ppc_load_tbl(env);
-    target_ulong lpcr, lpcr_mask;
     struct kvmppc_hv_guest_state *hvstate;
     struct kvmppc_hv_guest_state hv_state;
     struct kvmppc_pt_regs *regs;
     hwaddr len;
-    uint64_t cr;
-    int i;
 
-    if (spapr->nested_ptcr == 0) {
+    if (spapr->nested.ptcr == 0) {
         return H_NOT_AVAILABLE;
     }
 
@@ -1593,90 +1735,18 @@ static target_ulong h_enter_nested(PowerPCCPU *cpu,
         return H_PARAMETER;
     }
 
-    spapr_cpu->nested_host_state = g_try_new(CPUPPCState, 1);
-    if (!spapr_cpu->nested_host_state) {
-        return H_NO_MEM;
-    }
-
-    memcpy(spapr_cpu->nested_host_state, env, sizeof(CPUPPCState));
 
     len = sizeof(*regs);
     regs = address_space_map(CPU(cpu)->as, regs_ptr, &len, false,
                                 MEMTXATTRS_UNSPECIFIED);
     if (!regs || len != sizeof(*regs)) {
         address_space_unmap(CPU(cpu)->as, regs, len, 0, false);
-        g_free(spapr_cpu->nested_host_state);
         return H_P2;
     }
 
-    len = sizeof(env->gpr);
-    assert(len == sizeof(regs->gpr));
-    memcpy(env->gpr, regs->gpr, len);
-
-    env->lr = regs->link;
-    env->ctr = regs->ctr;
-    cpu_write_xer(env, regs->xer);
-
-    cr = regs->ccr;
-    for (i = 7; i >= 0; i--) {
-        env->crf[i] = cr & 15;
-        cr >>= 4;
-    }
-
-    env->msr = regs->msr;
-    env->nip = regs->nip;
+    enter_nested(cpu, hv_state.lpid, &hv_state, regs, NULL);
 
     address_space_unmap(CPU(cpu)->as, regs, len, len, false);
-
-    env->cfar = hv_state.cfar;
-
-    assert(env->spr[SPR_LPIDR] == 0);
-    env->spr[SPR_LPIDR] = hv_state.lpid;
-
-    lpcr_mask = LPCR_DPFD | LPCR_ILE | LPCR_AIL | LPCR_LD | LPCR_MER;
-    lpcr = (env->spr[SPR_LPCR] & ~lpcr_mask) | (hv_state.lpcr & lpcr_mask);
-    lpcr |= LPCR_HR | LPCR_UPRT | LPCR_GTSE | LPCR_HVICE | LPCR_HDICE;
-    lpcr &= ~LPCR_LPES0;
-    env->spr[SPR_LPCR] = lpcr & pcc->lpcr_mask;
-
-    env->spr[SPR_PCR] = hv_state.pcr;
-    /* hv_state.amor is not used */
-    env->spr[SPR_DPDES] = hv_state.dpdes;
-    env->spr[SPR_HFSCR] = hv_state.hfscr;
-    hdec = hv_state.hdec_expiry - now;
-    spapr_cpu->nested_tb_offset = hv_state.tb_offset;
-    /* TCG does not implement DAWR*, CIABR, PURR, SPURR, IC, VTB, HEIR SPRs*/
-    env->spr[SPR_SRR0] = hv_state.srr0;
-    env->spr[SPR_SRR1] = hv_state.srr1;
-    env->spr[SPR_SPRG0] = hv_state.sprg[0];
-    env->spr[SPR_SPRG1] = hv_state.sprg[1];
-    env->spr[SPR_SPRG2] = hv_state.sprg[2];
-    env->spr[SPR_SPRG3] = hv_state.sprg[3];
-    env->spr[SPR_BOOKS_PID] = hv_state.pidr;
-    env->spr[SPR_PPR] = hv_state.ppr;
-
-    cpu_ppc_hdecr_init(env);
-    cpu_ppc_store_hdecr(env, hdec);
-
-    /*
-     * The hv_state.vcpu_token is not needed. It is used by the KVM
-     * implementation to remember which L2 vCPU last ran on which physical
-     * CPU so as to invalidate process scope translations if it is moved
-     * between physical CPUs. For now TLBs are always flushed on L1<->L2
-     * transitions so this is not a problem.
-     *
-     * Could validate that the same vcpu_token does not attempt to run on
-     * different L1 vCPUs at the same time, but that would be a L1 KVM bug
-     * and it's not obviously worth a new data structure to do it.
-     */
-
-    env->tb_env->tb_offset += spapr_cpu->nested_tb_offset;
-    spapr_cpu->in_nested = true;
-
-    hreg_compute_hflags(env);
-    ppc_maybe_interrupt(env);
-    tlb_flush(cs);
-    env->reserve_addr = -1; /* Reset the reservation */
 
     /*
      * The spapr hcall helper sets env->gpr[3] to the return value, but at
@@ -1687,38 +1757,871 @@ static target_ulong h_enter_nested(PowerPCCPU *cpu,
     return env->gpr[3];
 }
 
-void spapr_exit_nested(PowerPCCPU *cpu, int excp)
+#define NESTED_GUEST_MAX 4096
+#define NESTED_GUEST_VCPU_MAX 2048
+
+#define VCPU_OUT_BUF_MIN_SZ      0x80ULL
+#define H_GUEST_DELETE_ALL_MASK  0x8000000000000000ULL
+
+struct guest_state_element {
+    uint16_t id;   /* Big Endian */
+    uint16_t size; /* Big Endian */
+    uint8_t value[]; /* Big Endian (based on size above) */
+} QEMU_PACKED;
+
+struct guest_state_buffer {
+    uint32_t num_elements; /* Big Endian */
+    struct guest_state_element elements[];
+} QEMU_PACKED;
+
+#define GUEST_STATE_REQUEST_GUEST_WIDE      0x1
+#define GUEST_STATE_REQUEST_SET             0x2
+#define GUEST_STATE_REQUEST_TAKE_OWNERSHIP  0x4
+
+/* Actuall buffer plus some metadata about the request */
+struct guest_state_request {
+    struct guest_state_buffer *gsb;
+    int64_t buf;
+    int64_t len;
+    uint16_t flags;
+};
+
+#define GUEST_STATE_ELEMENT_TYPE_FLAG_GUEST_WIDE 0x1
+#define GUEST_STATE_ELEMENT_TYPE_FLAG_READ_ONLY  0x2
+
+struct guest_state_element_type {
+    uint16_t id;
+    int size;
+    uint16_t flags;
+    void *(* location)(SpaprMachineStateNestedGuest *, target_ulong);
+    size_t offset;
+    void (* copy)(void *, void *, bool);
+};
+
+SpaprMachineStateNestedGuest *spapr_get_nested_guest(SpaprMachineState *spapr,
+                                                     target_ulong lpid)
 {
-    CPUState *cs = CPU(cpu);
-    CPUPPCState *env = &cpu->env;
-    SpaprCpuState *spapr_cpu = spapr_cpu_state(cpu);
-    target_ulong r3_return = env->excp_vectors[excp]; /* hcall return value */
-    target_ulong hv_ptr = spapr_cpu->nested_host_state->gpr[4];
-    target_ulong regs_ptr = spapr_cpu->nested_host_state->gpr[5];
-    struct kvmppc_hv_guest_state *hvstate;
-    struct kvmppc_pt_regs *regs;
-    hwaddr len;
-    uint64_t cr;
-    int i;
-
-    assert(spapr_cpu->in_nested);
-
-    cpu_ppc_hdecr_exit(env);
-
-    len = sizeof(*hvstate);
-    hvstate = address_space_map(CPU(cpu)->as, hv_ptr, &len, true,
-                                MEMTXATTRS_UNSPECIFIED);
-    if (len != sizeof(*hvstate)) {
-        address_space_unmap(CPU(cpu)->as, hvstate, len, 0, true);
-        r3_return = H_PARAMETER;
-        goto out_restore_l1;
+    SpaprMachineStateNestedGuest *guest;
+    guest = g_hash_table_lookup(spapr->nested.guests, GINT_TO_POINTER(lpid));
+    if (!guest) {
+        assert(0);
+        return NULL;
     }
 
-    hvstate->cfar = env->cfar;
+    return guest;
+}
+
+static bool vcpu_check(SpaprMachineStateNestedGuest *guest,
+                       target_ulong vcpuid,
+                       bool inoutbuf)
+{
+    struct SpaprMachineStateNestedGuestVcpu *vcpu;
+
+    if (vcpuid >= NESTED_GUEST_VCPU_MAX) {
+        assert(0);
+        return false;
+    }
+
+    if (!(vcpuid < guest->vcpus)) {
+        assert(0);
+        return false;
+    }
+
+    vcpu = &guest->vcpu[vcpuid];
+    if (!vcpu->enabled) {
+        assert(0);
+        return false;
+    }
+
+    if (!inoutbuf)
+        return true;
+
+    /* Check to see if the in/out buffers are registered */
+    if (vcpu->runbufin.addr && vcpu->runbufout.addr)
+        return true;
+
+    assert(0);
+    return false;
+}
+
+/* set=1 means the L1 is trying to set some state
+ * set=0 means the L1 is trying to get some state */
+static void copy_state(void *a, void *b, int size, bool set)
+{
+    /* set takes from the Big endian element_buf and sets internal
+     * buffer */
+
+    assert(size == 8);
+
+    if (set)
+        *(uint64_t *)a = be64_to_cpu(*(uint64_t *)b);
+    else
+        *(uint64_t *)b = cpu_to_be64(*(uint64_t *)a);
+}
+
+static void copy_state_16to16(void *a, void *b, bool set)
+{
+    uint64_t *src, *dst;
+
+    if (set) {
+        src = b;
+        dst = a;
+
+        dst[1]= be64_to_cpu(src[0]);
+        dst[0] = be64_to_cpu(src[1]);
+    } else {
+        src = a;
+        dst = b;
+
+        dst[1] = cpu_to_be64(src[0]);
+        dst[0] = cpu_to_be64(src[1]);
+    }
+}
+
+static void copy_state_8to8(void *a, void *b, bool set)
+{
+    copy_state(a, b, 8, set);
+}
+
+static void copy_state_4to8(void *a, void *b, bool set)
+{
+    if (set)
+        *(uint64_t *)a  = (uint64_t) be32_to_cpu(*(uint32_t *)b);
+    else
+        *(uint32_t *)b = cpu_to_be32((uint32_t) (*((uint64_t *)a)));
+}
+
+static void copy_state_pagetbl(void *a, void *b, bool set)
+{
+    uint64_t *pagetbl;
+    uint64_t *buf; /* 3 double words */
+    uint64_t rts;
+
+    assert(set);
+
+    pagetbl = a;
+    buf = b;
+
+    *pagetbl = be64_to_cpu(buf[0]);
+    *pagetbl |= PATE0_HR;
+
+    /* RTS */
+    rts = be64_to_cpu(buf[1]);
+    assert(rts == 52);
+    rts = rts - 31;
+    *pagetbl |=  ((rts & 0x7) << 5);
+    *pagetbl |=  (((rts >> 3) & 0x3) << 61);
+
+    /* RPDS */
+    *pagetbl |= 63 - clz64(be64_to_cpu(buf[2])) - 3;
+}
+
+static void copy_state_proctbl(void *a, void *b, bool set)
+{
+    uint64_t *proctbl;
+    uint64_t *buf; /* 2 double words */
+
+    assert(set);
+
+    proctbl = a;
+    buf = b;
+
+    *proctbl = be64_to_cpu(buf[0]);
+
+    if (be64_to_cpu(buf[1]) == (1ULL << 12))
+            *proctbl |= 0;
+    else if (be64_to_cpu(buf[1]) == (1ULL << 24))
+            *proctbl |= 12;
+    else
+        assert(0);
+}
+
+static void copy_state_runbuf(void *a, void *b, bool set)
+{
+    uint64_t *buf; /* 2 double words */
+    struct SpaprMachineStateNestedGuestVcpuRunBuf *runbuf;
+
+    assert(set);
+
+    runbuf = a;
+    buf = b;
+
+    runbuf->addr = be64_to_cpu(buf[0]);
+    assert(runbuf->addr);
+
+    /* per spec */
+    assert(be64_to_cpu(buf[1]) <= 16384);
+
+    /* This will also hit in the input buffer but should be fine for
+     * now. If not we can split this function.
+     */
+    assert(be64_to_cpu(buf[1]) >= VCPU_OUT_BUF_MIN_SZ);
+
+    runbuf->size = be64_to_cpu(buf[1]);
+}
+
+/* tell the L1 how big we want the output vcpu run buffer */
+static void out_buf_min_size(void *a, void *b, bool set)
+{
+    uint64_t *buf; /* 1 double word */
+
+    assert(!set);
+
+    buf = b;
+
+    buf[0] = cpu_to_be64(VCPU_OUT_BUF_MIN_SZ);
+}
+
+static void copy_logical_pvr(void *a, void *b, bool set)
+{
+    uint32_t *buf; /* 1 word */
+    uint32_t *pvr_logical_ptr;
+    uint32_t pvr_logical;
+
+    pvr_logical_ptr = a;
+    buf = b;
+
+    if (!set) {
+        buf[0] = cpu_to_be32(*pvr_logical_ptr);
+        return;
+    }
+
+    pvr_logical = be32_to_cpu(buf[0]);
+    /* don't change the major version */
+    if ((pvr_logical & CPU_POWERPC_POWER_SERVER_MASK) !=
+        (*pvr_logical_ptr & CPU_POWERPC_POWER_SERVER_MASK))
+        assert(0);
+
+    *pvr_logical_ptr = pvr_logical;
+}
+
+static void copy_tb_offset(void *a, void *b, bool set)
+{
+    SpaprMachineStateNestedGuest *guest;
+    uint64_t *buf; /* 1 double word */
+    uint64_t *tb_offset_ptr;
+    uint64_t tb_offset;
+
+    tb_offset_ptr = a;
+    buf = b;
+
+    if (!set) {
+        buf[0] = cpu_to_be64(*tb_offset_ptr);
+        return;
+    }
+
+    tb_offset = be64_to_cpu(buf[0]);
+    /* need to copy this to the individual tb_offset for each vcpu */
+    guest = container_of(tb_offset_ptr, struct SpaprMachineStateNestedGuest, tb_offset);
+    for (int i = 0; i < guest->vcpus; i++)
+        guest->vcpu[i].tb_offset = tb_offset;
+}
+
+static void copy_state_dec_expire_tb(void *a, void *b, bool set)
+{
+    int64_t *dec_expiry_tb;
+    uint64_t *buf; /* 1 double word */
+
+    dec_expiry_tb = a;
+    buf = b;
+
+    if (!set) {
+        buf[0] = cpu_to_be64(*dec_expiry_tb);
+        return;
+    }
+
+    *dec_expiry_tb = be64_to_cpu(buf[0]);
+}
+
+static void copy_state_hdecr(void *a, void *b, bool set)
+{
+    uint64_t *buf; /* 1 double word */
+    CPUPPCState *env;
+
+    env = a;
+    buf = b;
+
+    if (!set) {
+        buf[0] = cpu_to_be64(env->tb_env->hdecr_expiry_tb);
+        return;
+    }
+
+    env->tb_env->hdecr_expiry_tb = be64_to_cpu(buf[0]);
+}
+
+static void copy_state_vscr(void *a, void *b, bool set)
+{
+    uint32_t *buf; /* 1 word */
+    CPUPPCState *env;
+
+    env = a;
+    buf = b;
+
+    if (!set) {
+        buf[0] = cpu_to_be32(ppc_get_vscr(env));
+        return;
+    }
+
+    ppc_store_vscr(env, be32_to_cpu(buf[0]));
+}
+
+static void copy_state_fpscr(void *a, void *b, bool set)
+{
+    uint64_t *buf; /* 1 double word */
+    CPUPPCState *env;
+
+    env = a;
+    buf = b;
+
+    if (!set) {
+        buf[0] = cpu_to_be64(env->fpscr);
+        return;
+    }
+
+    ppc_store_fpscr(env, be64_to_cpu(buf[0]));
+}
+
+static void copy_state_cr(void *a, void *b, bool set)
+{
+    uint32_t *buf; /* 1 word */
+    CPUPPCState *env;
+    uint64_t cr; /* api v1 uses uint64_t but papr acr v2 mentions 4 bytes */
+    env = a;
+    buf = b;
+
+    if (!set) {
+        buf[0] = cpu_to_be32((uint32_t)ppc_get_cr(env));
+        return;
+    }
+    cr = be32_to_cpu(buf[0]);
+    ppc_store_cr(env, cr);
+}
+
+static void *get_vcpu_env_ptr(SpaprMachineStateNestedGuest *guest,
+                              target_ulong vcpuid)
+{
+    assert(vcpu_check(guest, vcpuid, false));
+    return &guest->vcpu[vcpuid].env;
+}
+
+static void *get_vcpu_ptr(SpaprMachineStateNestedGuest *guest,
+                                   target_ulong vcpuid)
+{
+    assert(vcpu_check(guest, vcpuid, false));
+    return &guest->vcpu[vcpuid];
+}
+
+static void *get_guest_ptr(SpaprMachineStateNestedGuest *guest,
+                           target_ulong vcpuid)
+{
+    return guest;
+}
+
+#define GUEST_STATE_ELEMENT(i, sz, s, f, ptr, c) { \
+    .id = (i),                                     \
+    .size = (sz),                                  \
+    .location = ptr,                               \
+    .offset = offsetof(struct s, f),               \
+    .copy = (c)                                    \
+}
+
+#define GSBE_NESTED(i, sz, f, c) {                             \
+    .id = (i),                                                 \
+    .size = (sz),                                              \
+    .location = get_guest_ptr,                                 \
+    .offset = offsetof(struct SpaprMachineStateNestedGuest, f),\
+    .copy = (c)                                                \
+}
+
+#define GSBE_NESTED_VCPU(i, sz, f, c) {                            \
+    .id = (i),                                                     \
+    .size = (sz),                                                  \
+    .location = get_vcpu_ptr,                                      \
+    .offset = offsetof(struct SpaprMachineStateNestedGuestVcpu, f),\
+    .copy = (c)                                                    \
+}
+
+#define GUEST_STATE_ELEMENT_NOP(i, sz) { \
+    .id = (i),                             \
+    .size = (sz),                          \
+    .location = NULL,                      \
+    .offset = 0,                           \
+    .copy = NULL                           \
+}
+#define GUEST_STATE_ELEMENT_NOP_DW(i)   \
+        GUEST_STATE_ELEMENT_NOP(i, 8)
+#define GUEST_STATE_ELEMENT_NOP_W(i) \
+        GUEST_STATE_ELEMENT_NOP(i, 4)
+
+#define GUEST_STATE_ELEMENT_ENV_BASE(i, s, c) {  \
+            .id = (i),                           \
+            .size = (s),                         \
+            .location = get_vcpu_env_ptr,        \
+            .offset = 0,                         \
+            .copy = (c)                          \
+    }
+
+#define GUEST_STATE_ELEMENT_ENV(i, s, f, c) {    \
+            .id = (i),                           \
+            .size = (s),                         \
+            .location = get_vcpu_env_ptr,        \
+            .offset = offsetof(CPUPPCState, f),  \
+            .copy = (c)                          \
+    }
+#define GUEST_STATE_ELEMENT_ENV_DW(i, f) \
+    GUEST_STATE_ELEMENT_ENV(i, 8, f, copy_state_8to8)
+#define GUEST_STATE_ELEMENT_ENV_W(i, f) \
+    GUEST_STATE_ELEMENT_ENV(i, 4, f, copy_state_4to8)
+
+struct guest_state_element_type guest_state_element_types[] = {
+    GUEST_STATE_ELEMENT_NOP(GSB_HV_VCPU_IGNORED_ID, 0),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR0,  gpr[0]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR1,  gpr[1]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR2,  gpr[2]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR3,  gpr[3]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR4,  gpr[4]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR5,  gpr[5]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR6,  gpr[6]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR7,  gpr[7]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR8,  gpr[8]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR9,  gpr[9]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR10, gpr[10]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR11, gpr[11]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR12, gpr[12]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR13, gpr[13]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR14, gpr[14]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR15, gpr[15]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR16, gpr[16]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR17, gpr[17]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR18, gpr[18]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR19, gpr[19]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR20, gpr[20]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR21, gpr[21]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR22, gpr[22]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR23, gpr[23]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR24, gpr[24]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR25, gpr[25]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR26, gpr[26]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR27, gpr[27]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR28, gpr[28]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR29, gpr[29]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR30, gpr[30]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_GPR31, gpr[31]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_NIA, nip),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_MSR, msr),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_CTR, ctr),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_LR, lr),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_XER, xer),
+    GUEST_STATE_ELEMENT_ENV_BASE(GSB_VCPU_SPR_CR, 4, copy_state_cr),
+    GUEST_STATE_ELEMENT_NOP_DW(GSB_VCPU_SPR_MMCR3),
+    GUEST_STATE_ELEMENT_NOP_DW(GSB_VCPU_SPR_SIER2),
+    GUEST_STATE_ELEMENT_NOP_DW(GSB_VCPU_SPR_SIER3),
+    GUEST_STATE_ELEMENT_NOP_W (GSB_VCPU_SPR_WORT),
+
+   /* GUEST_STATE_ELEMENT_HV_REGS_DW(GSB_VCPU_HDEC_LPID, lpid), */
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_LPCR, spr[SPR_LPCR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_AMOR, spr[SPR_AMOR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_HFSCR, spr[SPR_HFSCR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_DAWR0, spr[SPR_DAWR0]),
+    GUEST_STATE_ELEMENT_ENV_W(GSB_VCPU_SPR_DAWRX0, spr[SPR_DAWRX0]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_CIABR, spr[SPR_CIABR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_PURR,  spr[SPR_PURR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_SPURR, spr[SPR_SPURR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_IC,    spr[SPR_IC]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_VTB,   spr[SPR_VTB]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_HDAR,  spr[SPR_HDAR]),
+    GUEST_STATE_ELEMENT_ENV_W(GSB_VCPU_SPR_HDSISR, spr[SPR_HDSISR]),
+    GUEST_STATE_ELEMENT_ENV_W(GSB_VCPU_SPR_HEIR,   spr[SPR_HEIR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_ASDR,  spr[SPR_ASDR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_SRR0, spr[SPR_SRR0]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_SRR1, spr[SPR_SRR1]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_SPRG0, spr[SPR_SPRG0]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_SPRG1, spr[SPR_SPRG1]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_SPRG2, spr[SPR_SPRG2]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_SPRG3, spr[SPR_SPRG3]),
+    GUEST_STATE_ELEMENT_ENV_W(GSB_VCPU_SPR_PIDR,   spr[SPR_BOOKS_PID]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_CFAR, cfar),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_PPR, spr[SPR_PPR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_DAWR1, spr[SPR_DAWR1]),
+    GUEST_STATE_ELEMENT_ENV_W(GSB_VCPU_SPR_DAWRX1, spr[SPR_DAWRX1]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_DEXCR, spr[SPR_DEXCR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_HDEXCR, spr[SPR_HDEXCR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_HASHKEYR,  spr[SPR_HASHKEYR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_HASHPKEYR, spr[SPR_HASHPKEYR]),
+
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR0, 16, vsr[0], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR1, 16, vsr[1], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR2, 16, vsr[2], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR3, 16, vsr[3], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR4, 16, vsr[4], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR5, 16, vsr[5], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR6, 16, vsr[6], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR7, 16, vsr[7], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR8, 16, vsr[8], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR9, 16, vsr[9], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR10, 16, vsr[10], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR11, 16, vsr[11], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR12, 16, vsr[12], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR13, 16, vsr[13], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR14, 16, vsr[14], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR15, 16, vsr[15], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR16, 16, vsr[16], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR17, 16, vsr[17], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR18, 16, vsr[18], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR19, 16, vsr[19], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR20, 16, vsr[20], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR21, 16, vsr[21], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR22, 16, vsr[22], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR23, 16, vsr[23], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR24, 16, vsr[24], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR25, 16, vsr[25], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR26, 16, vsr[26], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR27, 16, vsr[27], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR28, 16, vsr[28], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR29, 16, vsr[29], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR30, 16, vsr[30], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR31, 16, vsr[31], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR32, 16, vsr[32], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR33, 16, vsr[33], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR34, 16, vsr[34], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR35, 16, vsr[35], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR36, 16, vsr[36], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR37, 16, vsr[37], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR38, 16, vsr[38], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR39, 16, vsr[39], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR40, 16, vsr[40], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR41, 16, vsr[41], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR42, 16, vsr[42], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR43, 16, vsr[43], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR44, 16, vsr[44], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR45, 16, vsr[45], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR46, 16, vsr[46], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR47, 16, vsr[47], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR48, 16, vsr[48], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR49, 16, vsr[49], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR50, 16, vsr[50], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR51, 16, vsr[51], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR52, 16, vsr[52], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR53, 16, vsr[53], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR54, 16, vsr[54], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR55, 16, vsr[55], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR56, 16, vsr[56], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR57, 16, vsr[57], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR58, 16, vsr[58], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR59, 16, vsr[59], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR60, 16, vsr[60], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR61, 16, vsr[61], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR62, 16, vsr[62], copy_state_16to16),
+    GUEST_STATE_ELEMENT_ENV(GSB_VCPU_SPR_VSR63, 16, vsr[63], copy_state_16to16),
+
+    GSBE_NESTED(GSB_PART_SCOPED_PAGETBL, 0x18, parttbl[0],  copy_state_pagetbl),
+    GSBE_NESTED(GSB_PROCESS_TBL,         0x10, parttbl[1],  copy_state_proctbl),
+    GSBE_NESTED(GSB_VCPU_LPVR,           0x4,  pvr_logical, copy_logical_pvr),
+    GSBE_NESTED(GSB_TB_OFFSET,           0x8,  tb_offset,   copy_tb_offset),
+    GSBE_NESTED_VCPU(GSB_VCPU_IN_BUFFER, 0x10, runbufin,    copy_state_runbuf),
+    GSBE_NESTED_VCPU(GSB_VCPU_OUT_BUFFER,0x10, runbufout,   copy_state_runbuf),
+    GSBE_NESTED_VCPU(GSB_VCPU_OUT_BUF_MIN_SZ, 0x8, runbufout, out_buf_min_size),
+    GSBE_NESTED_VCPU(GSB_VCPU_DEC_EXPIRE_TB, 0x8, dec_expiry_tb, copy_state_dec_expire_tb),
+
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_EBBHR, spr[SPR_EBBHR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_TAR,   spr[SPR_TAR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_EBBRR, spr[SPR_EBBRR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_BESCR, spr[SPR_BESCR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_IAMR , spr[SPR_IAMR ]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_AMR  , spr[SPR_AMR  ]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_UAMOR, spr[SPR_UAMOR]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_DSCR , spr[SPR_DSCR ]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_FSCR , spr[SPR_FSCR ]),
+    GUEST_STATE_ELEMENT_ENV_W (GSB_VCPU_SPR_PSPB , spr[SPR_PSPB ]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_CTRL , spr[SPR_CTRL ]),
+    GUEST_STATE_ELEMENT_ENV_W (GSB_VCPU_SPR_VRSAVE, spr[SPR_VRSAVE ]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_DAR , spr[SPR_DAR]),
+    GUEST_STATE_ELEMENT_ENV_W(GSB_VCPU_SPR_DSISR , spr[SPR_DSISR]),
+
+    GUEST_STATE_ELEMENT_ENV_W(GSB_VCPU_SPR_PMC1, spr[SPR_POWER_PMC1]),
+    GUEST_STATE_ELEMENT_ENV_W(GSB_VCPU_SPR_PMC2, spr[SPR_POWER_PMC2]),
+    GUEST_STATE_ELEMENT_ENV_W(GSB_VCPU_SPR_PMC3, spr[SPR_POWER_PMC3]),
+    GUEST_STATE_ELEMENT_ENV_W(GSB_VCPU_SPR_PMC4, spr[SPR_POWER_PMC4]),
+    GUEST_STATE_ELEMENT_ENV_W(GSB_VCPU_SPR_PMC5, spr[SPR_POWER_PMC5]),
+    GUEST_STATE_ELEMENT_ENV_W(GSB_VCPU_SPR_PMC6, spr[SPR_POWER_PMC6]),
+
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_MMCR0, spr[SPR_POWER_MMCR0]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_MMCR1, spr[SPR_POWER_MMCR1]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_MMCR2, spr[SPR_POWER_MMCR2]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_MMCRA, spr[SPR_POWER_MMCRA]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_SDAR , spr[SPR_POWER_SDAR ]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_SIAR , spr[SPR_POWER_SIAR ]),
+    GUEST_STATE_ELEMENT_ENV_DW(GSB_VCPU_SPR_SIER , spr[SPR_POWER_SIER ]),
+    GUEST_STATE_ELEMENT_ENV_BASE(GSB_VCPU_HDEC_EXPIRY_TB, 8, copy_state_hdecr),
+    GUEST_STATE_ELEMENT_ENV_BASE(GSB_VCPU_SPR_VSCR,  4, copy_state_vscr),
+    GUEST_STATE_ELEMENT_ENV_BASE(GSB_VCPU_SPR_FPSCR, 8, copy_state_fpscr)
+};
+
+static struct guest_state_element *guest_state_element_next(
+    struct guest_state_element *element,
+    int64_t *len,
+    int64_t *num_elements)
+{
+    uint16_t size;
+
+    /* size is of element->value[] only. Not whole guest_state_element */
+    size = be16_to_cpu(element->size);
+
+    if (len)
+        *len -= size + offsetof(struct guest_state_element, value);
+
+    if (num_elements)
+        *num_elements -= 1;
+
+    return (struct guest_state_element *)(element->value + size);
+}
+
+static void print_element(struct guest_state_element *element,
+                          struct guest_state_request *gsr)
+{
+    printf("id:0x%04x size:0x%04x %s ",
+           be16_to_cpu(element->id), be16_to_cpu(element->size),
+           gsr->flags & GUEST_STATE_REQUEST_SET ? "set" : "get");
+    printf("buf:0x%016lx ...\n", be64_to_cpu(*(uint64_t *)element->value));
+}
+
+static struct guest_state_element_type *guest_state_element_type_find(uint16_t id)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(guest_state_element_types); i++)
+        if (id == guest_state_element_types[i].id)
+            return &guest_state_element_types[i];
+
+    return NULL;
+}
+
+static bool guest_state_request_check(struct guest_state_request *gsr)
+{
+    int64_t num_elements, len = gsr->len;
+    struct guest_state_buffer *gsb = gsr->gsb;
+    struct guest_state_element *element;
+    struct guest_state_element_type *type;
+    uint16_t id, size;
+
+    /* gsb->num_elements = 0 == 32 bits long */
+    assert(len >= 4);
+
+    num_elements = be32_to_cpu(gsb->num_elements);
+    element = gsb->elements;
+    len -= sizeof(gsb->num_elements);
+
+    /* Walk the buffer to validate the length */
+    while (num_elements) {
+
+        id = be16_to_cpu(element->id);
+        size = be16_to_cpu(element->size);
+
+        if (false)
+            print_element(element, gsr);
+        /* buffer size too small */
+        if (len < 0) {
+            assert(0);
+            return false;
+        }
+
+        type = guest_state_element_type_find(id);
+        if (!type) {
+            printf("%s: Element ID %04x unknown\n", __func__, id);
+            print_element(element, gsr);
+            assert(0);
+            return false;
+        }
+
+        if (id == GSB_HV_VCPU_IGNORED_ID) {
+            goto next_element;
+        }
+
+        if (size != type->size) {
+            printf("%s: Size mismatch. Element ID:%04x. Size Wanted:%i Got:%i\n",
+                   __func__, id, type->size, size);
+            print_element(element, gsr);
+            assert(0);
+            return false;
+        }
+
+        if ((type->flags & GUEST_STATE_ELEMENT_TYPE_FLAG_READ_ONLY) &&
+            (gsr->flags & GUEST_STATE_REQUEST_SET)) {
+            printf("%s: trying to set a read-only element type. Element ID:%04x.\n",
+                   __func__, id);
+            assert(0);
+            return false;
+        }
+
+        if (type->flags & GUEST_STATE_ELEMENT_TYPE_FLAG_GUEST_WIDE) {
+            /* guest wide element type */
+            if (!(gsr->flags & GUEST_STATE_REQUEST_GUEST_WIDE)) {
+                printf("%s: trying to set a guest wide element type. Element ID:%04x.\n",
+                       __func__, id);
+                assert(0);
+                return false;
+            }
+        } else {
+            /* thread wide element type */
+            if (gsr->flags & GUEST_STATE_REQUEST_GUEST_WIDE) {
+                printf("%s: trying to set a thread wide element type. Element ID:%04x.\n",
+                       __func__, id);
+                assert(0);
+                return false;
+            }
+        }
+next_element:
+        element = guest_state_element_next(element, &len, &num_elements);
+
+    }
+    return true;
+}
+
+static target_ulong getset_state(SpaprMachineStateNestedGuest *guest,
+                                 uint64_t vcpuid,
+                                 struct guest_state_request *gsr)
+{
+
+    void *ptr;
+    uint16_t id;
+    struct guest_state_element *element;
+    struct guest_state_element_type *type;
+    int64_t lenleft, num_elements;
+
+    lenleft = gsr->len;
+
+    if (!guest_state_request_check(gsr)) {
+        assert(0);
+        return H_P3;
+    }
+
+    num_elements = be32_to_cpu(gsr->gsb->num_elements);
+    element = gsr->gsb->elements;
+    /* Process the elements */
+    while (num_elements) {
+        type = NULL;
+        /* Debug print before doing anything */
+        if (false)
+            print_element(element, gsr);
+
+        id = be16_to_cpu(element->id);
+        if (id == GSB_HV_VCPU_IGNORED_ID) {
+            goto next_element;
+        }
+
+        type = guest_state_element_type_find(id);
+        assert(type); /* should have been caught in guest_state_request_check() above */
+
+        /* Get pointer to guest data to get/set */
+        if (type->location && type->copy) {
+            ptr = type->location(guest, vcpuid);
+            assert(ptr);
+            type->copy(ptr + type->offset, element->value,
+                       gsr->flags & GUEST_STATE_REQUEST_SET? true: false);
+        }
+
+
+next_element:
+        element = guest_state_element_next(element, &lenleft, &num_elements);
+    }
+
+    return H_SUCCESS;
+}
+
+struct run_vcpu_exit_cause {
+    uint64_t nia;
+    uint64_t count;
+    uint16_t ids[10]; /* FIXME make this dynamic */
+};
+
+struct run_vcpu_exit_cause run_vcpu_exit_causes[] = {
+    { .nia = 0x980,
+      .count = 0,
+    },
+    { .nia = 0xc00,
+      .count = 10,
+      .ids = {
+          GSB_VCPU_GPR3,
+          GSB_VCPU_GPR4,
+          GSB_VCPU_GPR5,
+          GSB_VCPU_GPR6,
+          GSB_VCPU_GPR7,
+          GSB_VCPU_GPR8,
+          GSB_VCPU_GPR9,
+          GSB_VCPU_GPR10,
+          GSB_VCPU_GPR11,
+          GSB_VCPU_GPR12,
+      },
+    },
+    { .nia = 0xe00,
+      .count = 5,
+      .ids = {
+          GSB_VCPU_SPR_HDAR,
+          GSB_VCPU_SPR_HDSISR,
+          GSB_VCPU_SPR_ASDR,
+          GSB_VCPU_SPR_NIA,
+          GSB_VCPU_SPR_MSR,
+      },
+    },
+    { .nia = 0xe20,
+      .count = 4,
+      .ids = {
+          GSB_VCPU_SPR_HDAR,
+          GSB_VCPU_SPR_ASDR,
+          GSB_VCPU_SPR_NIA,
+          GSB_VCPU_SPR_MSR,
+      },
+    },
+    { .nia = 0xe40,
+      .count = 2, /* 3 */
+      .ids = {
+          /* GSB_VCPU_SPR_HEIR, */
+          GSB_VCPU_SPR_NIA,
+          GSB_VCPU_SPR_MSR,
+      },
+    },
+    { .nia = 0xea0,
+      .count = 0,
+    },
+    { .nia = 0xf80,
+      .count = 3,
+      .ids = {
+          GSB_VCPU_SPR_HFSCR,
+          GSB_VCPU_SPR_NIA,
+          GSB_VCPU_SPR_MSR,
+      },
+    },
+};
+
+static struct run_vcpu_exit_cause *find_exit_cause(uint64_t srr0)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(run_vcpu_exit_causes); i++)
+        if (srr0 == run_vcpu_exit_causes[i].nia)
+            return &run_vcpu_exit_causes[i];
+
+    printf("%s: srr0:0x%016lx\n", __func__, srr0);
+    assert(0);
+    return NULL;
+}
+
+static void restore_hvstate_from_env(struct kvmppc_hv_guest_state *hvstate,
+                                     CPUPPCState *env, int excp)
+{
     hvstate->lpcr = env->spr[SPR_LPCR];
-    hvstate->pcr = env->spr[SPR_PCR];
-    hvstate->dpdes = env->spr[SPR_DPDES];
     hvstate->hfscr = env->spr[SPR_HFSCR];
+    hvstate->cfar = env->cfar;
+    hvstate->pcr     = env->spr[SPR_PCR];
+    hvstate->dpdes   = env->spr[SPR_DPDES];
+    hvstate->srr0    = env->spr[SPR_SRR0];
+    hvstate->srr1    = env->spr[SPR_SRR1];
+    hvstate->sprg[0] = env->spr[SPR_SPRG0];
+    hvstate->sprg[1] = env->spr[SPR_SPRG1];
+    hvstate->sprg[2] = env->spr[SPR_SPRG2];
+    hvstate->sprg[3] = env->spr[SPR_SPRG3];
+    hvstate->pidr    = env->spr[SPR_BOOKS_PID];
+    hvstate->ppr     = env->spr[SPR_PPR];
 
     if (excp == POWERPC_EXCP_HDSI) {
         hvstate->hdar = env->spr[SPR_HDAR];
@@ -1727,43 +2630,36 @@ void spapr_exit_nested(PowerPCCPU *cpu, int excp)
     } else if (excp == POWERPC_EXCP_HISI) {
         hvstate->asdr = env->spr[SPR_ASDR];
     }
+}
 
-    /* HEIR should be implemented for HV mode and saved here. */
-    hvstate->srr0 = env->spr[SPR_SRR0];
-    hvstate->srr1 = env->spr[SPR_SRR1];
-    hvstate->sprg[0] = env->spr[SPR_SPRG0];
-    hvstate->sprg[1] = env->spr[SPR_SPRG1];
-    hvstate->sprg[2] = env->spr[SPR_SPRG2];
-    hvstate->sprg[3] = env->spr[SPR_SPRG3];
-    hvstate->pidr = env->spr[SPR_BOOKS_PID];
-    hvstate->ppr = env->spr[SPR_PPR];
+static int map_and_restore_hvstate(PowerPCCPU *cpu, int excp, target_ulong *r3)
+{
+    CPUPPCState *env = &cpu->env;
+    SpaprCpuState *spapr_cpu = spapr_cpu_state(cpu);
+    target_ulong hv_ptr = spapr_cpu->nested_host_state->gpr[4];
+    struct kvmppc_hv_guest_state *hvstate;
+    hwaddr len = sizeof(*hvstate);
 
+    hvstate = address_space_map(CPU(cpu)->as, hv_ptr, &len, true,
+                                MEMTXATTRS_UNSPECIFIED);
+    if (len != sizeof(*hvstate)) {
+        address_space_unmap(CPU(cpu)->as, hvstate, len, 0, true);
+        *r3 = H_PARAMETER;
+        return -1;
+    }
+    restore_hvstate_from_env(hvstate, env, excp);
     /* Is it okay to specify write length larger than actual data written? */
     address_space_unmap(CPU(cpu)->as, hvstate, len, len, true);
+    return 0;
+}
 
-    len = sizeof(*regs);
-    regs = address_space_map(CPU(cpu)->as, regs_ptr, &len, true,
-                                MEMTXATTRS_UNSPECIFIED);
-    if (!regs || len != sizeof(*regs)) {
-        address_space_unmap(CPU(cpu)->as, regs, len, 0, true);
-        r3_return = H_P2;
-        goto out_restore_l1;
-    }
-
+static void restore_ptregs_from_env(struct kvmppc_pt_regs *regs,
+                                    CPUPPCState *env, int excp)
+{
+    hwaddr len;
     len = sizeof(env->gpr);
     assert(len == sizeof(regs->gpr));
     memcpy(regs->gpr, env->gpr, len);
-
-    regs->link = env->lr;
-    regs->ctr = env->ctr;
-    regs->xer = cpu_read_xer(env);
-
-    cr = 0;
-    for (i = 0; i < 8; i++) {
-        cr |= (env->crf[i] & 15) << (4 * (7 - i));
-    }
-    regs->ccr = cr;
-
     if (excp == POWERPC_EXCP_MCHECK ||
         excp == POWERPC_EXCP_RESET ||
         excp == POWERPC_EXCP_SYSCALL) {
@@ -1773,44 +2669,182 @@ void spapr_exit_nested(PowerPCCPU *cpu, int excp)
         regs->nip = env->spr[SPR_HSRR0];
         regs->msr = env->spr[SPR_HSRR1] & env->msr_mask;
     }
+    regs->link = env->lr;
+    regs->ctr  = env->ctr;
+    regs->xer  = cpu_read_xer(env);
+    regs->ccr  = ppc_get_cr(env);
+}
 
+static int map_and_restore_ptregs(PowerPCCPU *cpu, int excp, target_ulong *r3)
+{
+    CPUPPCState *env = &cpu->env;
+    SpaprCpuState *spapr_cpu = spapr_cpu_state(cpu);
+    target_ulong regs_ptr = spapr_cpu->nested_host_state->gpr[5];
+    hwaddr len;
+    struct kvmppc_pt_regs *regs = NULL;
+
+    len = sizeof(*regs);
+    regs = address_space_map(CPU(cpu)->as, regs_ptr, &len, true,
+                             MEMTXATTRS_UNSPECIFIED);
+    if (!regs || len != sizeof(*regs)) {
+        address_space_unmap(CPU(cpu)->as, regs, len, 0, true);
+        *r3 = H_P2;
+        return -1;
+    }
+    restore_ptregs_from_env(regs, env, excp);
     /* Is it okay to specify write length larger than actual data written? */
     address_space_unmap(CPU(cpu)->as, regs, len, len, true);
+    return 0;
+}
 
-out_restore_l1:
-    memcpy(env->gpr, spapr_cpu->nested_host_state->gpr, sizeof(env->gpr));
-    env->lr = spapr_cpu->nested_host_state->lr;
-    env->ctr = spapr_cpu->nested_host_state->ctr;
-    memcpy(env->crf, spapr_cpu->nested_host_state->crf, sizeof(env->crf));
-    env->cfar = spapr_cpu->nested_host_state->cfar;
-    env->xer = spapr_cpu->nested_host_state->xer;
-    env->so = spapr_cpu->nested_host_state->so;
-    env->ov = spapr_cpu->nested_host_state->ov;
-    env->ov32 = spapr_cpu->nested_host_state->ov32;
-    env->ca32 = spapr_cpu->nested_host_state->ca32;
-    env->msr = spapr_cpu->nested_host_state->msr;
-    env->nip = spapr_cpu->nested_host_state->nip;
+static void exit_nested_restore_vcpu(PowerPCCPU *cpu, int excp,
+                                     SpaprMachineStateNestedGuestVcpu *vcpu)
+{
+    CPUPPCState *env = &cpu->env;
+    target_ulong now, hdar, hdsisr, asdr;
 
+    assert(sizeof(env->gpr) == sizeof(vcpu->env.gpr)); /* sanity check */
+
+    now = cpu_ppc_load_tbl(env); // L2 timebase
+    now -= vcpu->tb_offset; // L1 timebase
+    vcpu->dec_expiry_tb = now - cpu_ppc_load_decr(env);
+    /* backup hdar, hdsisr, asdr if reqd later below */
+    hdar   = vcpu->env.spr[SPR_HDAR];
+    hdsisr = vcpu->env.spr[SPR_HDSISR];
+    asdr   = vcpu->env.spr[SPR_ASDR];
+
+    restore_common_regs(&vcpu->env, env);
+
+    if (excp == POWERPC_EXCP_MCHECK ||
+        excp == POWERPC_EXCP_RESET ||
+        excp == POWERPC_EXCP_SYSCALL) {
+        vcpu->env.nip = env->spr[SPR_SRR0];
+        vcpu->env.msr = env->spr[SPR_SRR1] & env->msr_mask;
+    } else {
+        vcpu->env.nip = env->spr[SPR_HSRR0];
+        vcpu->env.msr = env->spr[SPR_HSRR1] & env->msr_mask;
+    }
+
+    /* hdar, hdsisr, asdr should be retained unless certain exceptions */
+    if ((excp != POWERPC_EXCP_HDSI) && (excp != POWERPC_EXCP_HISI)) {
+        vcpu->env.spr[SPR_ASDR] = asdr;
+    } else if (excp != POWERPC_EXCP_HDSI) {
+        vcpu->env.spr[SPR_HDAR]   = hdar;
+        vcpu->env.spr[SPR_HDSISR] = hdsisr;
+    }
+}
+
+static void exit_process_output_buffer(PowerPCCPU *cpu,
+                                      SpaprMachineStateNestedGuest *guest,
+                                      target_ulong vcpuid,
+                                      target_ulong *r3)
+{
+    SpaprMachineStateNestedGuestVcpu *vcpu = &guest->vcpu[vcpuid];
+    struct guest_state_request gsr;
+    struct guest_state_buffer *gsb;
+    struct guest_state_element *element;
+    struct guest_state_element_type *type;
+    struct run_vcpu_exit_cause *exit_cause;
+    hwaddr len;
+    int i;
+
+    len = vcpu->runbufout.size;
+    gsb = address_space_map(CPU(cpu)->as, vcpu->runbufout.addr, &len, true,
+                            MEMTXATTRS_UNSPECIFIED);
+    if (!gsb || len != vcpu->runbufout.size) {
+        assert(0);
+        address_space_unmap(CPU(cpu)->as, gsb, len, 0, true);
+        *r3 = H_P2;
+        return;
+    }
+
+    exit_cause = find_exit_cause(*r3);
+
+    /* Create a buffer of elements to send back */
+    gsb->num_elements = cpu_to_be32(exit_cause->count);
+    element = gsb->elements;
+    for (i = 0; i < exit_cause->count; i++) {
+        type = guest_state_element_type_find(exit_cause->ids[i]);
+        assert(type);
+        element->id = cpu_to_be16(exit_cause->ids[i]);
+        element->size = cpu_to_be16(type->size);
+        element = guest_state_element_next(element, NULL, NULL);
+    }
+    gsr.gsb = gsb;
+    gsr.len = VCPU_OUT_BUF_MIN_SZ;
+    gsr.flags = 0; /* get + never guest wide */
+    getset_state(guest, vcpuid, &gsr);
+
+    address_space_unmap(CPU(cpu)->as, gsb, len, len, true);
+    return;
+}
+
+void spapr_exit_nested(PowerPCCPU *cpu, int excp)
+{
+    SpaprMachineState *spapr = SPAPR_MACHINE(qdev_get_machine());
+    CPUState *cs = CPU(cpu);
+    CPUPPCState *env = &cpu->env;
+    SpaprCpuState *spapr_cpu = spapr_cpu_state(cpu);
+    target_ulong r3_return = env->excp_vectors[excp]; /* hcall return value */
+    target_ulong lpid = 0, vcpuid = 0;
+    struct SpaprMachineStateNestedGuestVcpu *vcpu;
+    struct SpaprMachineStateNestedGuest *guest = NULL;
+    uint32_t tmp_pending_interrupts;
+
+    assert(spapr_cpu->in_nested);
+
+    cpu_ppc_hdecr_exit(env);
+
+    /* TODO: change vhc->deliver_hv_excp rather than do this */
+    if (spapr->nested.api == NESTED_API_KVM_HV) {
+        if (map_and_restore_hvstate(cpu, excp, &r3_return) ||
+            map_and_restore_ptregs (cpu, excp, &r3_return)) {
+            goto out_restore_l1;
+        }
+    } else if (spapr->nested.api == NESTED_API_PAPR) {
+        lpid = spapr_cpu->nested_host_state->gpr[5];
+        vcpuid = spapr_cpu->nested_host_state->gpr[6];
+        guest = spapr_get_nested_guest(spapr, lpid);
+        assert(guest);
+        vcpu_check(guest, vcpuid, false);
+        vcpu = &guest->vcpu[vcpuid];
+
+        exit_nested_restore_vcpu(cpu, excp, vcpu);
+
+        /* do the output buffer for run_vcpu*/
+        exit_process_output_buffer(cpu, guest, vcpuid, &r3_return);
+    } else
+        assert(0);
+
+
+    out_restore_l1:
     assert(env->spr[SPR_LPIDR] != 0);
-    env->spr[SPR_LPCR] = spapr_cpu->nested_host_state->spr[SPR_LPCR];
-    env->spr[SPR_LPIDR] = spapr_cpu->nested_host_state->spr[SPR_LPIDR];
-    env->spr[SPR_PCR] = spapr_cpu->nested_host_state->spr[SPR_PCR];
-    env->spr[SPR_DPDES] = 0;
-    env->spr[SPR_HFSCR] = spapr_cpu->nested_host_state->spr[SPR_HFSCR];
-    env->spr[SPR_SRR0] = spapr_cpu->nested_host_state->spr[SPR_SRR0];
-    env->spr[SPR_SRR1] = spapr_cpu->nested_host_state->spr[SPR_SRR1];
-    env->spr[SPR_SPRG0] = spapr_cpu->nested_host_state->spr[SPR_SPRG0];
-    env->spr[SPR_SPRG1] = spapr_cpu->nested_host_state->spr[SPR_SPRG1];
-    env->spr[SPR_SPRG2] = spapr_cpu->nested_host_state->spr[SPR_SPRG2];
-    env->spr[SPR_SPRG3] = spapr_cpu->nested_host_state->spr[SPR_SPRG3];
-    env->spr[SPR_BOOKS_PID] = spapr_cpu->nested_host_state->spr[SPR_BOOKS_PID];
-    env->spr[SPR_PPR] = spapr_cpu->nested_host_state->spr[SPR_PPR];
+
+    /* Save external and hypervisor virtualization interrupts */
+    tmp_pending_interrupts = env->pending_interrupts &
+                     (PPC_INTERRUPT_EXT | PPC_INTERRUPT_HVIRT);
+
+    /* copy all the env state */
+    *env = *spapr_cpu->nested_host_state;
 
     /*
-     * Return the interrupt vector address from H_ENTER_NESTED to the L1
-     * (or error code).
+     * OR the external and hypervisor virtualization interrupts
+     * in the cpu env. This will result in L1 calling its do_IRQ
+     * generic interrupt handling routine. This is important for
+     * responsiveness in L1 and consequently also L2.
      */
-    env->gpr[3] = r3_return;
+    env->pending_interrupts |= tmp_pending_interrupts;
+
+    if (spapr->nested.api == NESTED_API_PAPR) {
+        env->gpr[3] = H_SUCCESS;
+        env->gpr[4] = r3_return;
+    } else {
+        /*
+         * Return the interrupt vector address from H_ENTER_NESTED to the L1
+         * (or error code).
+         */
+        env->gpr[3] = r3_return;
+    }
 
     env->tb_env->tb_offset -= spapr_cpu->nested_tb_offset;
     spapr_cpu->in_nested = false;
@@ -1824,12 +2858,428 @@ out_restore_l1:
     spapr_cpu->nested_host_state = NULL;
 }
 
+static void init_nested(void)
+{
+    struct guest_state_element_type *type;
+    int i;
+
+    /* Fill in the table. Could do this statically, but easier here */
+    for (i = 0; i < ARRAY_SIZE(guest_state_element_types); i++) {
+        type = &guest_state_element_types[i];
+
+        if (type->id > GSB_LAST)
+            assert(0);
+        else if (type->id >= GSB_VCPU_SPR_HDAR)
+            /* 0xf000 - 0xf005 Thread + RO */
+            type->flags = GUEST_STATE_ELEMENT_TYPE_FLAG_READ_ONLY;
+        else if (type->id >= GSB_VCPU_IN_BUFFER)
+            /* 0x0c00 - 0xf000 Thread + RW */
+            type->flags = 0;
+        else if (type->id >= GSB_VCPU_LPVR)
+            /* 0x0003 - 0x0bff Guest + RW */
+            type->flags = GUEST_STATE_ELEMENT_TYPE_FLAG_GUEST_WIDE;
+        else if (type->id >= GSB_HV_VCPU_STATE_SIZE)
+            /* 0x0001 - 0x0002 Guest + RO */
+            type->flags = GUEST_STATE_ELEMENT_TYPE_FLAG_READ_ONLY |
+                          GUEST_STATE_ELEMENT_TYPE_FLAG_GUEST_WIDE;
+    }
+}
+
+#define H_GUEST_CAPABILITIES_COPY_MEM 0x8000000000000000
+#define H_GUEST_CAPABILITIES_P9_MODE  0x4000000000000000
+#define H_GUEST_CAPABILITIES_P10_MODE 0x2000000000000000
+
+static target_ulong h_guest_get_capabilities(PowerPCCPU *cpu,
+                                             SpaprMachineState *spapr,
+                                             target_ulong opcode,
+                                             target_ulong *args)
+{
+    CPUPPCState *env = &cpu->env;
+    target_ulong flags = args[0];
+
+    if (!tcg_enabled())
+        return H_FUNCTION;
+
+    if (flags) { /* don't handle any flags capabilities for now */
+        assert(0);
+        return H_UNSUPPORTED_FLAG;
+    }
+
+    if ((env->spr[SPR_PVR] & CPU_POWERPC_POWER_SERVER_MASK) ==
+        (CPU_POWERPC_POWER9_BASE))
+        env->gpr[4] = H_GUEST_CAPABILITIES_P9_MODE;
+
+    if ((env->spr[SPR_PVR] & CPU_POWERPC_POWER_SERVER_MASK) ==
+        (CPU_POWERPC_POWER10_BASE))
+        env->gpr[4] = H_GUEST_CAPABILITIES_P10_MODE;
+
+    return H_SUCCESS;
+}
+
+static target_ulong h_guest_set_capabilities(PowerPCCPU *cpu,
+                                             SpaprMachineState *spapr,
+                                             target_ulong opcode,
+                                              target_ulong *args)
+{
+    CPUPPCState *env = &cpu->env;
+    target_ulong flags = args[0];
+    target_ulong capabilities = args[1];
+
+    if (!tcg_enabled())
+        return H_FUNCTION;
+
+    if (flags) { /* don't handle any flags capabilities for now */
+        assert(0);
+        return H_UNSUPPORTED_FLAG;
+    }
+
+
+    /* isn't supported */
+    if (capabilities & H_GUEST_CAPABILITIES_COPY_MEM) {
+        env->gpr[4] = 0;
+        assert(0);
+        return H_P2;
+    }
+
+    if ((env->spr[SPR_PVR] & CPU_POWERPC_POWER_SERVER_MASK) ==
+        (CPU_POWERPC_POWER9_BASE)) {
+        /* We are a P9 */
+        if (!(capabilities & H_GUEST_CAPABILITIES_P9_MODE)) {
+            env->gpr[4] = 1;
+            assert(0);
+            return H_P2;
+        }
+    }
+
+    if ((env->spr[SPR_PVR] & CPU_POWERPC_POWER_SERVER_MASK) ==
+        (CPU_POWERPC_POWER10_BASE)) {
+        /* We are a P10 */
+        if (!(capabilities & H_GUEST_CAPABILITIES_P10_MODE)) {
+            env->gpr[4] = 2;
+            assert(0);
+            return H_P2;
+        }
+    }
+
+    spapr->nested.capabilities_set = true;
+
+    spapr->nested.pvr_base = env->spr[SPR_PVR];
+
+    return H_SUCCESS;
+}
+
+static void
+destroy_guest_helper(gpointer value)
+{
+    struct SpaprMachineStateNestedGuest *guest = value;
+    int i = 0;
+    for (i=0; i < guest->vcpus; i++) {
+        cpu_ppc_tb_free(&guest->vcpu[i].env);
+    }
+    g_free(guest->vcpu);
+    g_free(guest);
+}
+
+static target_ulong h_guest_create(PowerPCCPU *cpu,
+                                   SpaprMachineState *spapr,
+                                   target_ulong opcode,
+                                   target_ulong *args)
+{
+    CPUPPCState *env = &cpu->env;
+    target_ulong flags = args[0];
+    target_ulong continue_token = args[1];
+    uint64_t lpid;
+    int nguests = 0;
+    struct SpaprMachineStateNestedGuest *guest;
+
+    if (!tcg_enabled())
+        return H_FUNCTION;
+
+    if (flags) /* don't handle any flags for now */
+        return H_UNSUPPORTED_FLAG;
+
+    if (continue_token != -1)
+        return H_P2;
+
+    if (!spapr_get_cap(spapr, SPAPR_CAP_NESTED_PAPR)) {
+        return H_FUNCTION;
+    }
+
+    if (!spapr->nested.capabilities_set) {
+        assert(0);
+        return H_STATE;
+    }
+
+    if (!spapr->nested.guests) {
+        spapr->nested.lpid_max = NESTED_GUEST_MAX;
+        spapr->nested.guests = g_hash_table_new_full(NULL,
+                                                     NULL,
+                                                     NULL,
+                                                     destroy_guest_helper);
+    }
+
+    nguests = g_hash_table_size(spapr->nested.guests);
+
+    if (nguests == spapr->nested.lpid_max)
+        return H_NO_MEM;
+
+    /* Allocate lpids linearly. FIXME: make faster */
+    for (lpid = 1; lpid < spapr->nested.lpid_max; lpid++)
+        if (!(g_hash_table_lookup(spapr->nested.guests, GINT_TO_POINTER(lpid))))
+            break;
+    if (lpid == spapr->nested.lpid_max)
+        return H_NO_MEM;
+
+    guest = g_try_new0(struct SpaprMachineStateNestedGuest, 1);
+    if (!guest)
+        return H_NO_MEM;
+
+    guest->pvr_logical = spapr->nested.pvr_base;
+
+    g_hash_table_insert(spapr->nested.guests, GINT_TO_POINTER(lpid), guest);
+    printf("%s: lpid: %lu (MAX: %i)\n", __func__, lpid, spapr->nested.lpid_max);
+
+    env->gpr[4] = lpid;
+    return H_SUCCESS;
+}
+
+static target_ulong h_guest_delete(PowerPCCPU *cpu,
+                                   SpaprMachineState *spapr,
+                                   target_ulong opcode,
+                                   target_ulong *args)
+{
+    target_ulong flags = args[0];
+    target_ulong lpid = args[1];
+    struct SpaprMachineStateNestedGuest *guest;
+
+    if (!tcg_enabled())
+        return H_FUNCTION;
+
+    /* handle flag deleteAllGuests, remaining bits reserved */
+    if (flags & ~H_GUEST_DELETE_ALL_MASK) {
+        return H_UNSUPPORTED_FLAG;
+    } else if (flags & H_GUEST_DELETE_ALL_MASK) {
+        g_hash_table_destroy(spapr->nested.guests);
+        return H_SUCCESS;
+    }
+
+    /* FIXME: check to see if any vcpus are running */
+
+    if (!spapr_get_cap(spapr, SPAPR_CAP_NESTED_PAPR))
+        return H_FUNCTION;
+
+    guest = g_hash_table_lookup(spapr->nested.guests, GINT_TO_POINTER(lpid));
+    if (!guest)
+        return H_P2;
+
+    g_hash_table_remove(spapr->nested.guests, GINT_TO_POINTER(lpid));
+
+    return H_SUCCESS;
+}
+
+static target_ulong h_guest_create_vcpu(PowerPCCPU *cpu,
+                                        SpaprMachineState *spapr,
+                                        target_ulong opcode,
+                                        target_ulong *args)
+{
+    target_ulong flags = args[0];
+    target_ulong lpid = args[1];
+    target_ulong vcpuid = args[2];
+    SpaprMachineStateNestedGuest *guest;
+
+    if (!tcg_enabled())
+        return H_FUNCTION;
+
+    if (flags) /* don't handle any flags for now */
+        return H_UNSUPPORTED_FLAG;
+
+    guest = spapr_get_nested_guest(spapr, lpid);
+    if (!guest)
+        return H_PARAMETER;
+
+    if (guest->vcpus == NESTED_GUEST_VCPU_MAX)
+        return H_P3;
+
+    if (guest->vcpus) {
+        struct SpaprMachineStateNestedGuestVcpu *vcpus;
+        vcpus = g_try_renew(struct SpaprMachineStateNestedGuestVcpu, guest->vcpu,
+                            guest->vcpus + 1);
+        if (!vcpus)
+            return H_NO_MEM;
+        memset(&vcpus[guest->vcpus], 0, sizeof(struct SpaprMachineStateNestedGuestVcpu));
+        /* need to memset to zero otherwise we leak L1 state to L2 */
+        memset(&vcpus[guest->vcpus].env, 0, sizeof(CPUPPCState));
+        cpu_ppc_tb_init(&vcpus[guest->vcpus].env, SPAPR_TIMEBASE_FREQ);
+        guest->vcpu = vcpus;
+    } else {
+        guest->vcpu = g_try_new0(struct SpaprMachineStateNestedGuestVcpu, 1);
+        if (guest->vcpu == NULL)
+            return H_NO_MEM;
+        /* need to memset to zero otherwise we leak L1 state to L2 */
+        memset(&guest->vcpu->env, 0, sizeof(CPUPPCState));
+        cpu_ppc_tb_init(&guest->vcpu->env, SPAPR_TIMEBASE_FREQ);
+    }
+
+    guest->vcpus++;
+    assert(vcpuid < guest->vcpus);
+    guest->vcpu[vcpuid].enabled = true;
+
+    /* double check we didn't screw up */
+    if (!vcpu_check(guest, vcpuid, false))
+        return H_PARAMETER;
+
+    return H_SUCCESS;
+}
+
+static target_ulong map_and_getset_state(PowerPCCPU *cpu,
+                                         SpaprMachineStateNestedGuest *guest,
+                                         uint64_t vcpuid,
+                                         struct guest_state_request *gsr)
+{
+    target_ulong rc;
+    int64_t lenleft, len;
+
+    assert(gsr->len < (1024*1024)); /* sanity check */
+
+    lenleft = len = gsr->len;
+    gsr->gsb = address_space_map(CPU(cpu)->as, gsr->buf, (uint64_t *)&len,
+                                 false, MEMTXATTRS_UNSPECIFIED);
+    if (!gsr->gsb) {
+        assert(0);
+        rc = H_P3;
+        goto out1;
+    }
+
+    if (len != lenleft) {
+        assert(0);
+        rc = H_P3;
+        goto out1;
+    }
+
+    getset_state(guest, vcpuid, gsr);
+
+    address_space_unmap(CPU(cpu)->as, gsr->gsb, len, len, false);
+    return H_SUCCESS;
+
+out1:
+    address_space_unmap(CPU(cpu)->as, gsr->gsb, len, 0, false);
+    return rc;
+}
+
+#define H_GUEST_GETSET_STATE_FLAG_GUEST_WIDE 0x8000000000000000
+
+static target_ulong h_guest_getset_state(PowerPCCPU *cpu,
+                                         SpaprMachineState *spapr,
+                                         target_ulong *args,
+                                         bool set)
+{
+    target_ulong flags = args[0];
+    target_ulong lpid = args[1];
+    target_ulong vcpuid = args[2];
+    target_ulong buf = args[3];
+    target_ulong buflen = args[4];
+    struct guest_state_request gsr;
+    SpaprMachineStateNestedGuest *guest;
+
+    if (!tcg_enabled())
+        return H_FUNCTION;
+
+    guest = spapr_get_nested_guest(spapr, lpid);
+    if (!guest){
+        assert(0);
+        return H_NOT_AVAILABLE;
+    }
+    gsr.buf = buf;
+    gsr.len = buflen;
+    gsr.flags = 0;
+    if (flags & H_GUEST_GETSET_STATE_FLAG_GUEST_WIDE)
+        gsr.flags |= GUEST_STATE_REQUEST_GUEST_WIDE;
+    if (flags & !H_GUEST_GETSET_STATE_FLAG_GUEST_WIDE)
+        assert(0);
+
+    if (set)
+        gsr.flags |= GUEST_STATE_REQUEST_SET;
+    return map_and_getset_state(cpu, guest, vcpuid, &gsr);
+}
+
+static target_ulong h_guest_set_state(PowerPCCPU *cpu,
+                                      SpaprMachineState *spapr,
+                                      target_ulong opcode,
+                                      target_ulong *args)
+{
+    return h_guest_getset_state(cpu, spapr, args, true);
+}
+
+static target_ulong h_guest_get_state(PowerPCCPU *cpu,
+                                      SpaprMachineState *spapr,
+                                      target_ulong opcode,
+                                      target_ulong *args)
+{
+    return h_guest_getset_state(cpu, spapr, args, false);
+}
+
+static target_ulong h_guest_run_vcpu(PowerPCCPU *cpu,
+                                     SpaprMachineState *spapr,
+                                     target_ulong opcode,
+                                     target_ulong *args)
+{
+    CPUPPCState *env = &cpu->env;
+    target_ulong flags = args[0];
+    target_ulong lpid = args[1];
+    target_ulong vcpuid = args[2];
+    struct SpaprMachineStateNestedGuestVcpu *vcpu;
+    struct guest_state_request gsr;
+    SpaprMachineStateNestedGuest *guest;
+
+    if (!tcg_enabled())
+        return H_FUNCTION;
+
+    if (flags) /* don't handle any flags for now */
+        return H_UNSUPPORTED_FLAG;
+
+    guest = spapr_get_nested_guest(spapr, lpid);
+    if (!guest)
+        return H_NOT_AVAILABLE;
+    if (!vcpu_check(guest, vcpuid, true))
+        return H_NOT_AVAILABLE;
+
+    if (guest->parttbl[0] == 0) {
+        /* At least need a partition scoped radix tree */
+        assert(0);
+        return H_NOT_AVAILABLE;
+    }
+
+    vcpu = &guest->vcpu[vcpuid];
+
+    /* Read run_vcpu input buffer to update state */
+    gsr.buf = vcpu->runbufin.addr;
+    gsr.len = vcpu->runbufin.size;
+    gsr.flags = GUEST_STATE_REQUEST_SET; /* Thread wide + writing */
+    map_and_getset_state(cpu, guest, vcpuid, &gsr);
+
+    enter_nested(cpu, lpid, NULL, NULL, vcpu);
+
+    return env->gpr[3];
+}
+
 static void hypercall_register_nested(void)
 {
     spapr_register_hypercall(KVMPPC_H_SET_PARTITION_TABLE, h_set_ptbl);
-    spapr_register_hypercall(KVMPPC_H_ENTER_NESTED, h_enter_nested);
-    spapr_register_hypercall(KVMPPC_H_TLB_INVALIDATE, h_tlb_invalidate);
-    spapr_register_hypercall(KVMPPC_H_COPY_TOFROM_GUEST, h_copy_tofrom_guest);
+    spapr_register_hypercall(KVMPPC_H_ENTER_NESTED,        h_enter_nested);
+    spapr_register_hypercall(KVMPPC_H_TLB_INVALIDATE,      h_tlb_invalidate);
+    spapr_register_hypercall(KVMPPC_H_COPY_TOFROM_GUEST,   h_copy_tofrom_guest);
+}
+
+void hypercall_register_nested_phyp(void)
+{
+    spapr_register_hypercall(H_GUEST_GET_CAPABILITIES, h_guest_get_capabilities);
+    spapr_register_hypercall(H_GUEST_SET_CAPABILITIES, h_guest_set_capabilities);
+    spapr_register_hypercall(H_GUEST_CREATE          , h_guest_create);
+    spapr_register_hypercall(H_GUEST_CREATE_VCPU     , h_guest_create_vcpu);
+    spapr_register_hypercall(H_GUEST_SET_STATE       , h_guest_set_state);
+    spapr_register_hypercall(H_GUEST_GET_STATE       , h_guest_get_state);
+    spapr_register_hypercall(H_GUEST_RUN_VCPU        , h_guest_run_vcpu);
+    spapr_register_hypercall(H_GUEST_DELETE          , h_guest_delete);
 }
 
 static void hypercall_register_softmmu(void)
@@ -1853,6 +3303,11 @@ static void hypercall_register_nested(void)
     /* DO NOTHING */
 }
 
+void hypercall_register_nested_phyp(void)
+{
+    /* DO NOTHING */
+}
+
 static void hypercall_register_softmmu(void)
 {
     /* hcall-pft */
@@ -1863,6 +3318,11 @@ static void hypercall_register_softmmu(void)
 
     /* hcall-bulk */
     spapr_register_hypercall(H_BULK_REMOVE, h_softmmu);
+}
+
+static void init_nested(void)
+{
+    /* DO NOTHING */
 }
 #endif
 
@@ -1923,6 +3383,8 @@ static void hypercall_register_types(void)
     spapr_register_hypercall(KVMPPC_H_UPDATE_DT, h_update_dt);
 
     hypercall_register_nested();
+
+    init_nested();
 }
 
 type_init(hypercall_register_types)

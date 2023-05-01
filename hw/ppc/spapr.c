@@ -1328,14 +1328,18 @@ static bool spapr_get_pate(PPCVirtualHypervisor *vhyp, PowerPCCPU *cpu,
         /* Copy PATE1:GR into PATE0:HR */
         entry->dw0 = spapr->patb_entry & PATE0_HR;
         entry->dw1 = spapr->patb_entry;
+        return true;
 
-    } else {
+    }
+    assert(spapr->nested.api);
+
+    if (spapr->nested.api == 1) {
         uint64_t patb, pats;
 
         assert(lpid != 0);
 
-        patb = spapr->nested_ptcr & PTCR_PATB;
-        pats = spapr->nested_ptcr & PTCR_PATS;
+        patb = spapr->nested.ptcr & PTCR_PATB;
+        pats = spapr->nested.ptcr & PTCR_PATS;
 
         /* Check if partition table is properly aligned */
         if (patb & MAKE_64BIT_MASK(0, pats + 12)) {
@@ -1352,9 +1356,24 @@ static bool spapr_get_pate(PPCVirtualHypervisor *vhyp, PowerPCCPU *cpu,
         patb += 16 * lpid;
         entry->dw0 = ldq_phys(CPU(cpu)->as, patb);
         entry->dw1 = ldq_phys(CPU(cpu)->as, patb + 8);
+
+        return true;
     }
 
+#ifdef CONFIG_TCG
+    /* API v2 */
+    SpaprMachineStateNestedGuest *guest;
+    assert(lpid != 0);
+    guest = spapr_get_nested_guest(spapr, lpid);
+    assert(guest != NULL);
+
+    entry->dw0 = guest->parttbl[0];
+    entry->dw1 = guest->parttbl[1];
+
     return true;
+#else
+    return false;
+#endif
 }
 
 #define HPTE(_table, _i)   (void *)(((uint64_t *)(_table)) + ((_i) * 2))
@@ -2083,6 +2102,7 @@ static const VMStateDescription vmstate_spapr = {
         &vmstate_spapr_cap_fwnmi,
         &vmstate_spapr_fwnmi,
         &vmstate_spapr_cap_rpt_invalidate,
+        &vmstate_spapr_cap_nested_papr,
         NULL
     }
 };
@@ -3426,6 +3446,10 @@ static void spapr_instance_init(Object *obj)
         spapr_get_host_serial, spapr_set_host_serial);
     object_property_set_description(obj, "host-serial",
         "Host serial number to advertise in guest device tree");
+
+    /* Nested */
+    spapr->nested.api = 0;
+    spapr->nested.capabilities_set = false;
 }
 
 static void spapr_machine_finalizefn(Object *obj)
@@ -4669,6 +4693,7 @@ static void spapr_machine_class_init(ObjectClass *oc, void *data)
     smc->default_caps.caps[SPAPR_CAP_IBS] = SPAPR_CAP_WORKAROUND;
     smc->default_caps.caps[SPAPR_CAP_HPT_MAXPAGESIZE] = 16; /* 64kiB */
     smc->default_caps.caps[SPAPR_CAP_NESTED_KVM_HV] = SPAPR_CAP_OFF;
+    smc->default_caps.caps[SPAPR_CAP_NESTED_PAPR] = SPAPR_CAP_OFF;
     smc->default_caps.caps[SPAPR_CAP_LARGE_DECREMENTER] = SPAPR_CAP_ON;
     smc->default_caps.caps[SPAPR_CAP_CCF_ASSIST] = SPAPR_CAP_ON;
     smc->default_caps.caps[SPAPR_CAP_FWNMI] = SPAPR_CAP_ON;
