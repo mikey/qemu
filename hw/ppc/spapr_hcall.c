@@ -3082,6 +3082,7 @@ static target_ulong h_guest_create_vcpu(PowerPCCPU *cpu,
                                         target_ulong opcode,
                                         target_ulong *args)
 {
+    CPUPPCState *env = &cpu->env, *l2env;
     target_ulong flags = args[0];
     target_ulong lpid = args[1];
     target_ulong vcpuid = args[2];
@@ -3107,18 +3108,19 @@ static target_ulong h_guest_create_vcpu(PowerPCCPU *cpu,
         if (!vcpus)
             return H_NO_MEM;
         memset(&vcpus[guest->vcpus], 0, sizeof(struct SpaprMachineStateNestedGuestVcpu));
-        /* need to memset to zero otherwise we leak L1 state to L2 */
-        memset(&vcpus[guest->vcpus].env, 0, sizeof(CPUPPCState));
-        cpu_ppc_tb_init(&vcpus[guest->vcpus].env, SPAPR_TIMEBASE_FREQ);
         guest->vcpu = vcpus;
+        l2env = &vcpus[guest->vcpus].env;
     } else {
         guest->vcpu = g_try_new0(struct SpaprMachineStateNestedGuestVcpu, 1);
         if (guest->vcpu == NULL)
             return H_NO_MEM;
-        /* need to memset to zero otherwise we leak L1 state to L2 */
-        memset(&guest->vcpu->env, 0, sizeof(CPUPPCState));
-        cpu_ppc_tb_init(&guest->vcpu->env, SPAPR_TIMEBASE_FREQ);
+        l2env = &guest->vcpu->env;
     }
+    /* need to memset to zero otherwise we leak L1 state to L2 */
+    memset(l2env, 0, sizeof(CPUPPCState));
+    /* Copy L1 PVR to L2 */
+    l2env->spr[SPR_PVR] = env->spr[SPR_PVR];
+    cpu_ppc_tb_init(l2env, SPAPR_TIMEBASE_FREQ);
 
     guest->vcpus++;
     assert(vcpuid < guest->vcpus);
