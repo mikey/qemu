@@ -2825,7 +2825,39 @@ void spapr_exit_nested(PowerPCCPU *cpu, int excp)
                      (PPC_INTERRUPT_EXT | PPC_INTERRUPT_HVIRT);
 
     /* copy all the env state */
-    *env = *spapr_cpu->nested_host_state;
+    if (spapr->nested.api == NESTED_API_KVM_HV) {
+        memcpy(env->gpr, spapr_cpu->nested_host_state->gpr, sizeof(env->gpr));
+        env->lr = spapr_cpu->nested_host_state->lr;
+        env->ctr = spapr_cpu->nested_host_state->ctr;
+        memcpy(env->crf, spapr_cpu->nested_host_state->crf, sizeof(env->crf));
+        env->cfar = spapr_cpu->nested_host_state->cfar;
+        env->xer = spapr_cpu->nested_host_state->xer;
+        env->so = spapr_cpu->nested_host_state->so;
+        env->ov = spapr_cpu->nested_host_state->ov;
+        env->ov32 = spapr_cpu->nested_host_state->ov32;
+        env->ca32 = spapr_cpu->nested_host_state->ca32;
+        env->msr = spapr_cpu->nested_host_state->msr;
+        env->nip = spapr_cpu->nested_host_state->nip;
+
+        assert(env->spr[SPR_LPIDR] != 0);
+        env->spr[SPR_LPCR] = spapr_cpu->nested_host_state->spr[SPR_LPCR];
+        env->spr[SPR_LPIDR] = spapr_cpu->nested_host_state->spr[SPR_LPIDR];
+        env->spr[SPR_PCR] = spapr_cpu->nested_host_state->spr[SPR_PCR];
+        env->spr[SPR_DPDES] = 0;
+        env->spr[SPR_HFSCR] = spapr_cpu->nested_host_state->spr[SPR_HFSCR];
+        env->spr[SPR_SRR0] = spapr_cpu->nested_host_state->spr[SPR_SRR0];
+        env->spr[SPR_SRR1] = spapr_cpu->nested_host_state->spr[SPR_SRR1];
+        env->spr[SPR_SPRG0] = spapr_cpu->nested_host_state->spr[SPR_SPRG0];
+        env->spr[SPR_SPRG1] = spapr_cpu->nested_host_state->spr[SPR_SPRG1];
+        env->spr[SPR_SPRG2] = spapr_cpu->nested_host_state->spr[SPR_SPRG2];
+        env->spr[SPR_SPRG3] = spapr_cpu->nested_host_state->spr[SPR_SPRG3];
+        env->spr[SPR_BOOKS_PID] = spapr_cpu->nested_host_state->spr[SPR_BOOKS_PID];
+        env->spr[SPR_PPR] = spapr_cpu->nested_host_state->spr[SPR_PPR];
+    } else {
+
+        /* API v2 */
+        restore_common_regs(env, spapr_cpu->nested_host_state);
+    }
 
     /*
      * OR the external and hypervisor virtualization interrupts
